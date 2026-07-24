@@ -103,9 +103,8 @@ with gr.Blocks(title="Photo + Audio -> Video") as demo:
 
 if __name__ == "__main__":
     # Locally this defaults to 127.0.0.1:7860 (matches what launching this
-    # app's self-check expects on macOS). In the Docker container used for
-    # deployment, GRADIO_SERVER_NAME=0.0.0.0 and PORT are set so the host's
-    # reverse proxy (e.g. Render) can actually reach the server.
+    # app's self-check expects on macOS). In Docker, GRADIO_SERVER_NAME=0.0.0.0
+    # and PORT are set so the container is reachable from outside it.
     server_name = os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1")
     server_port = int(os.environ.get("PORT", 7860))
     demo.queue().launch(server_name=server_name, server_port=server_port)
