@@ -3,32 +3,46 @@ Reusable photo + audio -> MP4 video engine.
 
 Same rendering techniques as the baby-birthday-video project (Ken Burns
 pans/zooms, sparkle overlay, pastel colour grade, cross-dissolve
-transitions, portrait/landscape-aware fitting), simplified down to the
-core use case: give it a list of photos and one audio file, get an MP4
-back. No lyric/caption-sync map — that didn't pan out well before, so
-it's left out here (worth revisiting later as its own feature).
+transitions, portrait/landscape-aware fitting, custom overlay video clips),
+simplified down to the core use case: give it a list of photos and one
+audio file, get an MP4 back. No lyric/caption-sync map — that didn't pan
+out well before, so it's left out here (worth revisiting later as its own
+feature).
 
 Import generate_video() and call it directly, or drive it from app.py.
 """
 
 import math
 import random
+import time
+
+import os
 
 import numpy as np
-from PIL import Image, ImageFilter, ImageDraw, ImageFont
-from moviepy import VideoClip, AudioFileClip, concatenate_videoclips, ImageClip
+import pillow_heif
+import proglog
+from PIL import Image, ImageFilter, ImageDraw, ImageFont, ImageOps
+from moviepy import VideoClip, VideoFileClip, AudioFileClip, concatenate_videoclips, ImageClip
 from moviepy.video.fx import CrossFadeIn, CrossFadeOut
-from moviepy.audio.fx import AudioFadeOut
+from moviepy.audio.fx import AudioFadeOut, AudioNormalize
 
 import config
 
-FULL_VIDEO_SIZE = (config.VIDEO_WIDTH, config.VIDEO_HEIGHT)
+# iPhone photos are commonly HEIC — Pillow can't open that format on its own,
+# so photos exported straight from the Photos app would otherwise fail here.
+pillow_heif.register_heif_opener()
+
 FULL_FPS = config.FPS
-PREVIEW_VIDEO_SIZE = (config.PREVIEW_WIDTH, config.PREVIEW_HEIGHT)
 PREVIEW_FPS = config.PREVIEW_FPS
 
 TRANSITION_DUR = config.TRANSITION_DURATION
 DIRECTIONS = ["zoom_in", "zoom_out", "pan_left", "pan_right"]
+
+
+def _smoothstep(x):
+    """Classic ease-in-out curve: slow-fast-slow instead of constant speed."""
+    x = max(0.0, min(1.0, x))
+    return x * x * (3 - 2 * x)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -68,8 +82,17 @@ def fit_portrait(img, size):
     return np.array(bg)
 
 
-def load_photo(path, size):
+def load_photo(path, size, auto_color=True):
     img = Image.open(path).convert("RGB")
+    if auto_color:
+        # Stretches each photo's own histogram so its darkest/brightest
+        # pixels reach near-black/near-white — evens out photos shot on
+        # different cameras/lighting instead of leaving some looking flat
+        # or washed out next to others.
+        try:
+            img = ImageOps.autocontrast(img, cutoff=config.AUTO_COLOR_CUTOFF)
+        except Exception:
+            pass
     if is_portrait(img):
         return fit_portrait(img, size), True
     else:
@@ -91,14 +114,84 @@ def apply_pastel_grade(frame):
     return np.clip(arr, 0, 255).astype(np.uint8)
 
 
+def apply_brightness(frame, factor):
+    """factor: 1.0 = unchanged, >1.0 = brighter, <1.0 = darker."""
+    if factor == 1.0:
+        return frame
+    arr = frame.astype(np.float32) * factor
+    return np.clip(arr, 0, 255).astype(np.uint8)
+
+
+_vignette_cache = {}
+
+
+def _get_vignette_mask(video_size, strength):
+    key = (video_size, strength)
+    cached = _vignette_cache.get(key)
+    if cached is not None:
+        return cached
+    W, H = video_size
+    y, x = np.ogrid[:H, :W]
+    cx, cy = W / 2, H / 2
+    dist = np.sqrt(((x - cx) / cx) ** 2 + ((y - cy) / cy) ** 2)
+    # Starts darkening beyond ~40% of the way to the corner, reaching
+    # (1 - strength) brightness right at the corners.
+    mask = 1.0 - strength * np.clip((dist - 0.4) / 0.6, 0, 1)
+    mask = mask.astype(np.float32)
+    _vignette_cache[key] = mask
+    return mask
+
+
+def apply_vignette(frame, video_size, strength):
+    if strength <= 0:
+        return frame
+    mask = _get_vignette_mask(video_size, strength)
+    arr = frame.astype(np.float32) * mask[:, :, None]
+    return np.clip(arr, 0, 255).astype(np.uint8)
+
+
+_grain_cache = {}
+
+
+def _get_grain_tiles(video_size, strength, count):
+    key = (video_size, strength, count)
+    cached = _grain_cache.get(key)
+    if cached is not None:
+        return cached
+    W, H = video_size
+    rng = np.random.default_rng(123)
+    tiles = [rng.normal(0, strength, (H, W, 1)).astype(np.float32) for _ in range(count)]
+    _grain_cache[key] = tiles
+    return tiles
+
+
+def apply_grain(frame, video_size, strength, count, t):
+    if strength <= 0:
+        return frame
+    tiles = _get_grain_tiles(video_size, strength, count)
+    idx = int(t * 12) % len(tiles)
+    arr = frame.astype(np.float32) + tiles[idx]
+    return np.clip(arr, 0, 255).astype(np.uint8)
+
+
 # ═══════════════════════════════════════════════════════════════
 #  KEN BURNS
 # ═══════════════════════════════════════════════════════════════
 
-def ken_burns_frame(base_img, t, duration, direction, video_size, portrait=False):
+def ken_burns_frame(base_img, t, duration, direction, video_size, portrait=False,
+                     ken_burns_enabled=True, apply_grade=True, brightness=1.0,
+                     ease_motion=True, vignette_strength=0.0, grain_strength=0.0,
+                     grain_count=config.GRAIN_PATTERN_COUNT):
     W, H = video_size
     img_h, img_w = base_img.shape[:2]
-    progress = t / max(duration, 0.001)
+    # A static (no pan/zoom) photo is just the animation's t=0 frame held
+    # for the whole clip — same centred crop, no motion over time.
+    progress = (t / max(duration, 0.001)) if ken_burns_enabled else 0.0
+    if ken_burns_enabled and ease_motion:
+        # Slow-fast-slow instead of constant speed — real camera moves
+        # rarely hold one constant speed, so this alone reads as noticeably
+        # less "slideshow-ish".
+        progress = _smoothstep(progress)
 
     if portrait:
         scale = 1.0 + 0.04 * (progress if direction == "zoom_in" else -progress + 0.04)
@@ -119,9 +212,11 @@ def ken_burns_frame(base_img, t, duration, direction, video_size, portrait=False
     y1 = max(0, min(int(cy * img_h) - crop_h // 2, img_h - crop_h))
 
     cropped = base_img[y1:y1 + crop_h, x1:x1 + crop_w]
-    return apply_pastel_grade(
-        np.array(Image.fromarray(cropped).resize((W, H), Image.LANCZOS))
-    )
+    resized = np.array(Image.fromarray(cropped).resize((W, H), Image.LANCZOS))
+    graded = apply_pastel_grade(resized) if apply_grade else resized
+    bright = apply_brightness(graded, brightness)
+    vignetted = apply_vignette(bright, video_size, vignette_strength)
+    return apply_grain(vignetted, video_size, grain_strength, grain_count, t)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -160,11 +255,60 @@ class SparkleSystem:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  OVERLAY CLIPS (e.g. hearts/confetti animations layered on every photo)
+# ═══════════════════════════════════════════════════════════════
+
+def load_overlay_clips(paths):
+    """Load uploaded overlay video/gif files once, reused across every photo clip."""
+    clips = []
+    for path in paths or []:
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in config.OVERLAY_SUPPORTED_EXTS:
+            continue
+        clips.append(VideoFileClip(path, has_mask=True))
+    return clips
+
+
+def close_overlay_clips(clips):
+    for clip in clips:
+        try:
+            clip.close()
+        except Exception:
+            pass
+
+
+def _overlay_frame(clip, t, video_size):
+    W, H = video_size
+    clip_t = t % clip.duration
+    raw = clip.get_frame(clip_t)
+    frame_img = Image.fromarray(raw.astype(np.uint8)).convert("RGBA")
+    frame_img = frame_img.resize((W, H), Image.LANCZOS)
+
+    if clip.mask is not None:
+        mask_raw = clip.mask.get_frame(clip_t)
+        mask_img = Image.fromarray((mask_raw * 255).astype(np.uint8), mode="L")
+        mask_img = mask_img.resize((W, H), Image.LANCZOS)
+        frame_img.putalpha(mask_img)
+    else:
+        # No real alpha channel (most stock "effect on black" clips) — treat
+        # brightness as opacity so the dark background disappears and only
+        # the bright effect (hearts, sparkles, confetti...) shows through.
+        arr = np.array(frame_img, dtype=np.float32)
+        luminance = arr[:, :, 0] * 0.299 + arr[:, :, 1] * 0.587 + arr[:, :, 2] * 0.114
+        alpha = np.clip(luminance / 255.0 * 2.0, 0, 1)
+        arr[:, :, 3] = (alpha * 255).astype(np.uint8)
+        frame_img = Image.fromarray(arr.astype(np.uint8), mode="RGBA")
+
+    arr = np.array(frame_img, dtype=np.float32)
+    arr[:, :, 3] = np.clip(arr[:, :, 3] * config.OVERLAY_OPACITY, 0, 255)
+    return arr.astype(np.uint8)
+
+
+# ═══════════════════════════════════════════════════════════════
 #  FONT / TEXT
 # ═══════════════════════════════════════════════════════════════
 
 def get_font(size):
-    import os
     for fp in [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
@@ -184,37 +328,71 @@ def get_font(size):
 # ═══════════════════════════════════════════════════════════════
 
 def build_photo_clip(photo_path, duration, direction, sparkle_sys, video_size, fps,
-                      lyric="", sparkle_enabled=True):
-    base_img, portrait = load_photo(photo_path, video_size)
+                      lyric="", sparkle_enabled=True, ken_burns_enabled=True,
+                      pastel_grade_enabled=True, overlay_clips=None, brightness=1.0,
+                      auto_color_enabled=True, ease_motion=True,
+                      vignette_strength=0.0, grain_strength=0.0,
+                      caption_slide_enabled=True):
+    base_img, portrait = load_photo(photo_path, video_size, auto_color=auto_color_enabled)
     W, H = video_size
 
-    lyric_layer = None
+    # The caption is built as its own small (text + padding) image rather
+    # than a full-frame layer, so it can be pasted at a position that
+    # slides per-frame — a full-frame layer would only support fading
+    # in place, not moving.
+    lyric_img = None
+    lyric_final_xy = None
     if lyric and lyric.strip():
         font = get_font(52)
-        txt_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        d = ImageDraw.Draw(txt_layer)
-        bbox = d.textbbox((0, 0), lyric, font=font)
+        probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        bbox = probe.textbbox((0, 0), lyric, font=font, align="center")
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        tx, ty = (W - tw) // 2, H - 130
         pad = 20
-        d.rounded_rectangle([tx - pad, ty - pad // 2, tx + tw + pad, ty + th + pad // 2], radius=16, fill=(0, 0, 0, 100))
-        d.text((tx + 2, ty + 2), lyric, font=font, fill=(255, 210, 230, 200))
-        d.text((tx, ty), lyric, font=font, fill=(255, 255, 255, 245))
-        lyric_layer = np.array(txt_layer)
+        box_w, box_h = tw + pad * 2, th + pad
+        lyric_img = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(lyric_img)
+        d.rounded_rectangle([0, 0, box_w, box_h], radius=16, fill=(0, 0, 0, 100))
+        text_x, text_y = pad - bbox[0], pad // 2 - bbox[1]
+        d.text((text_x + 2, text_y + 2), lyric, font=font, fill=(255, 210, 230, 200), align="center")
+        d.text((text_x, text_y), lyric, font=font, fill=(255, 255, 255, 245), align="center")
+        # Position proportional to frame height, not a fixed pixel offset —
+        # keeps captions sitting in a sensible spot across aspect ratios
+        # (a fixed 130px offset would sit very differently on a 1920-tall
+        # vertical export than on a 1080-tall landscape one).
+        final_x = (W - box_w) // 2
+        final_y = H - int(H * 0.12) - box_h
+        lyric_final_xy = (final_x, final_y)
 
     def make_frame(t):
-        frame = ken_burns_frame(base_img, t, duration, direction, video_size, portrait)
+        frame = ken_burns_frame(base_img, t, duration, direction, video_size, portrait,
+                                 ken_burns_enabled=ken_burns_enabled, apply_grade=pastel_grade_enabled,
+                                 brightness=brightness, ease_motion=ease_motion,
+                                 vignette_strength=vignette_strength, grain_strength=grain_strength)
         out = Image.fromarray(frame).convert("RGBA")
 
         if sparkle_enabled:
             sparks = sparkle_sys.render(t)
             out = Image.alpha_composite(out, Image.fromarray(sparks))
 
-        if lyric_layer is not None:
-            fade = min(t / 0.6, 1.0, (duration - t) / 0.6)
-            l_arr = lyric_layer.copy()
-            l_arr[:, :, 3] = (l_arr[:, :, 3] * max(fade, 0)).astype(np.uint8)
-            out = Image.alpha_composite(out, Image.fromarray(l_arr))
+        for clip in (overlay_clips or []):
+            ov_frame = _overlay_frame(clip, t, video_size)
+            out = Image.alpha_composite(out, Image.fromarray(ov_frame, mode="RGBA"))
+
+        if lyric_img is not None:
+            fade_in = min(t / 0.6, 1.0)
+            fade_out = min((duration - t) / 0.6, 1.0)
+            fade = max(min(fade_in, fade_out), 0.0)
+            if fade > 0:
+                final_x, final_y = lyric_final_xy
+                if caption_slide_enabled:
+                    slide = config.CAPTION_SLIDE_DISTANCE
+                    y_offset = int((1 - _smoothstep(fade_in)) * slide + (1 - _smoothstep(fade_out)) * slide)
+                else:
+                    y_offset = 0
+                layer = lyric_img.copy()
+                alpha = layer.getchannel("A").point(lambda a, f=fade: int(a * f))
+                layer.putalpha(alpha)
+                out.paste(layer, (final_x, final_y + y_offset), layer)
 
         return np.array(out.convert("RGB"))
 
@@ -235,10 +413,20 @@ def _order_photos(photos, photo_order):
     return photos
 
 
-def _build_schedule(photos, content_dur, photo_duration=None):
+def _caption_for(path, captions, fallback=""):
+    if not captions:
+        return fallback
+    return captions.get(os.path.basename(path).lower(), fallback)
+
+
+def _build_schedule(photos, content_dur, photo_duration=None, photo_captions=None):
     n = len(photos)
     per = photo_duration if photo_duration else max(content_dur / n, 1.0)
-    clips = [{"photo": photos[i], "duration": round(per, 3), "effect": DIRECTIONS[i % 4]} for i in range(n)]
+    clips = [
+        {"photo": photos[i], "duration": round(per, 3), "effect": DIRECTIONS[i % 4],
+         "lyric": _caption_for(photos[i], photo_captions)}
+        for i in range(n)
+    ]
     return clips
 
 
@@ -284,6 +472,37 @@ def _loop_and_trim(clips, content_dur):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  ENCODE PROGRESS (real frame-by-frame percentage + ETA)
+# ═══════════════════════════════════════════════════════════════
+
+class _EncodeProgressBridge(proglog.ProgressBarLogger):
+    """Feeds moviepy/ffmpeg's own per-frame progress bar into on_progress(
+    fraction, message) — this is the actual dominant cost of a render (the
+    per-frame Python compositing plus the ffmpeg pipe), so it gives an
+    honest percentage/ETA rather than a guess."""
+
+    def __init__(self, on_progress, label="Rendering video"):
+        super().__init__()
+        self.on_progress = on_progress
+        self.label = label
+        self._start_time = time.time()
+
+    def bars_callback(self, bar, attr, value, old_value=None):
+        if attr != "index":
+            return
+        total = self.bars[bar].get("total")
+        if not total:
+            return
+        fraction = min(max(value / total, 0.0), 1.0)
+        elapsed = time.time() - self._start_time
+        message = self.label
+        if fraction > 0.02:
+            eta = elapsed / fraction - elapsed
+            message = f"{self.label} — about {int(eta // 60)}m {int(eta % 60)}s left"
+        self.on_progress(fraction, message)
+
+
+# ═══════════════════════════════════════════════════════════════
 #  MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════════
 
@@ -298,8 +517,21 @@ def generate_video(
     opening_duration=config.DEFAULT_OPENING_DURATION,
     closing_duration=config.DEFAULT_CLOSING_DURATION,
     sparkle_enabled=config.SPARKLE_ENABLED_DEFAULT,
+    ken_burns_enabled=config.KEN_BURNS_ENABLED_DEFAULT,
+    pastel_grade_enabled=config.PASTEL_GRADE_ENABLED_DEFAULT,
+    brightness=config.BRIGHTNESS_DEFAULT,
+    ease_motion=config.EASE_KEN_BURNS_DEFAULT,
+    auto_color_enabled=config.AUTO_COLOR_ENABLED_DEFAULT,
+    audio_normalize_enabled=config.AUDIO_NORMALIZE_DEFAULT,
+    vignette_enabled=config.VIGNETTE_ENABLED_DEFAULT,
+    grain_enabled=config.GRAIN_ENABLED_DEFAULT,
+    caption_slide_enabled=config.CAPTION_SLIDE_ENABLED_DEFAULT,
+    aspect_ratio=config.DEFAULT_ASPECT_RATIO,
+    overlay_paths=None,
+    photo_captions=None,
     preview=False,
     progress_cb=None,
+    on_progress=None,
 ):
     """
     photo_paths: list of image file paths (at least 1)
@@ -312,8 +544,28 @@ def generate_video(
     opening_duration / closing_duration: fixed seconds for the first and last
         photo (only used when there are 3+ photos — see below)
     sparkle_enabled: overlay the built-in glitter/sparkle particles
+    ken_burns_enabled: slow pan/zoom motion; False = still photos
+    pastel_grade_enabled: warm pink/lavender colour grade
+    brightness: 1.0 = unchanged, >1.0 = brighter, <1.0 = darker
+    ease_motion: ease the Ken Burns pan/zoom in/out instead of constant speed
+    auto_color_enabled: auto-levels each photo's own contrast/exposure
+    audio_normalize_enabled: peak-normalize the audio track to 0dB
+    vignette_enabled: subtle darkening toward the frame edges
+    grain_enabled: adds a bit of flickering film-grain texture
+    caption_slide_enabled: captions slide up into place instead of just fading
+    aspect_ratio: one of config.ASPECT_RATIOS' keys, e.g. "16:9 (landscape)",
+        "9:16 (vertical / Reels)", "1:1 (square)"
+    overlay_paths: optional list of video/gif file paths (e.g. hearts,
+        confetti) composited on top of every photo
+    photo_captions: optional dict of {filename (lowercase, no path): caption
+        text} to caption one or more specific photos (any position, not just
+        opening/closing) — overrides title_text/closing_text for that photo
+        if it happens to be the opening or closing one.
     preview: render a fast, low-res/low-fps draft instead of the final quality
     progress_cb: optional callable(str) for status updates (e.g. for a UI)
+    on_progress: optional callable(fraction: float 0-1, message: str) fed by
+        the actual frame-by-frame encode progress (the dominant cost of a
+        render) — use this for a real percentage/ETA, not just log lines.
     """
     if not photo_paths:
         raise ValueError("No photos given.")
@@ -322,8 +574,11 @@ def generate_video(
         if progress_cb:
             progress_cb(msg)
 
-    video_size = PREVIEW_VIDEO_SIZE if preview else FULL_VIDEO_SIZE
+    ratio_key = aspect_ratio if aspect_ratio in config.ASPECT_RATIOS else config.DEFAULT_ASPECT_RATIO
+    video_size = tuple(config.ASPECT_RATIOS[ratio_key]["preview" if preview else "full"])
     fps = PREVIEW_FPS if preview else FULL_FPS
+    vignette_strength = config.VIGNETTE_STRENGTH if vignette_enabled else 0.0
+    grain_strength = config.GRAIN_STRENGTH if grain_enabled else 0.0
 
     report("Reading audio duration…")
     audio = AudioFileClip(audio_path)
@@ -339,11 +594,13 @@ def generate_video(
     # the rest of the audio.
     if len(photos) == 1:
         schedule = [{"photo": photos[0], "duration": song_dur, "effect": "zoom_in",
-                     "lyric": title_text or closing_text}]
+                     "lyric": _caption_for(photos[0], photo_captions, title_text or closing_text)}]
     elif len(photos) == 2:
         schedule = [
-            {"photo": photos[0], "duration": opening_duration, "effect": "zoom_in", "lyric": title_text},
-            {"photo": photos[1], "duration": closing_duration, "effect": "zoom_out", "lyric": closing_text},
+            {"photo": photos[0], "duration": opening_duration, "effect": "zoom_in",
+             "lyric": _caption_for(photos[0], photo_captions, title_text)},
+            {"photo": photos[1], "duration": closing_duration, "effect": "zoom_out",
+             "lyric": _caption_for(photos[1], photo_captions, closing_text)},
         ]
     else:
         opening_photo, closing_photo = photos[0], photos[-1]
@@ -356,7 +613,7 @@ def generate_video(
                 f"exceed the audio length ({song_dur:.1f}s) — lower them or use a longer audio file."
             )
 
-        raw_clips = _build_schedule(middle_photos, content_dur, photo_duration)
+        raw_clips = _build_schedule(middle_photos, content_dur, photo_duration, photo_captions)
         middle_schedule = _loop_and_trim(raw_clips, content_dur)
         if not middle_schedule:
             raise ValueError("Could not build a photo schedule long enough to cover the audio.")
@@ -376,54 +633,72 @@ def generate_video(
                 e["duration"] = round(e["duration"] + extra_per_clip, 3)
 
         schedule = (
-            [{"photo": opening_photo, "duration": opening_duration, "effect": "zoom_in", "lyric": title_text}]
+            [{"photo": opening_photo, "duration": opening_duration, "effect": "zoom_in",
+              "lyric": _caption_for(opening_photo, photo_captions, title_text)}]
             + middle_schedule
-            + [{"photo": closing_photo, "duration": closing_duration, "effect": "zoom_out", "lyric": closing_text}]
+            + [{"photo": closing_photo, "duration": closing_duration, "effect": "zoom_out",
+                "lyric": _caption_for(closing_photo, photo_captions, closing_text)}]
         )
 
     report(f"Building {len(schedule)} photo clip(s)…")
     sparkle = SparkleSystem(video_size)
-    video_clips = []
-    for i, entry in enumerate(schedule):
-        clip = build_photo_clip(
-            entry["photo"], entry["duration"], entry.get("effect", "zoom_in"), sparkle,
-            video_size, fps, lyric=entry.get("lyric", ""), sparkle_enabled=sparkle_enabled,
+    overlay_clips = load_overlay_clips(overlay_paths)
+    if overlay_clips:
+        report(f"Loaded {len(overlay_clips)} overlay clip(s).")
+
+    try:
+        video_clips = []
+        for i, entry in enumerate(schedule):
+            clip = build_photo_clip(
+                entry["photo"], entry["duration"], entry.get("effect", "zoom_in"), sparkle,
+                video_size, fps, lyric=entry.get("lyric", ""), sparkle_enabled=sparkle_enabled,
+                ken_burns_enabled=ken_burns_enabled, pastel_grade_enabled=pastel_grade_enabled,
+                overlay_clips=overlay_clips, brightness=brightness,
+                auto_color_enabled=auto_color_enabled, ease_motion=ease_motion,
+                vignette_strength=vignette_strength, grain_strength=grain_strength,
+                caption_slide_enabled=caption_slide_enabled,
+            )
+            effects = []
+            if i > 0:
+                effects.append(CrossFadeIn(TRANSITION_DUR))
+            if i < len(schedule) - 1:
+                effects.append(CrossFadeOut(TRANSITION_DUR))
+            if effects:
+                clip = clip.with_effects(effects)
+            video_clips.append(clip)
+            report(f"  [{i + 1}/{len(schedule)}] {entry['photo']} ({entry['duration']:.1f}s, {entry.get('effect')})")
+
+        report("Concatenating clips…")
+        final_video = concatenate_videoclips(video_clips, padding=-TRANSITION_DUR, method="compose")
+
+        video_dur = final_video.duration
+        diff = song_dur - video_dur
+        if diff > 0.5:
+            last_frame = ImageClip(final_video.get_frame(video_dur - 0.1), duration=diff + 0.5).with_fps(fps)
+            final_video = concatenate_videoclips([final_video, last_frame], method="compose")
+        elif diff < -0.5:
+            final_video = final_video.subclipped(0, song_dur)
+
+        report("Attaching audio…")
+        audio_effects = [AudioNormalize()] if audio_normalize_enabled else []
+        audio_effects.append(AudioFadeOut(2.0))
+        audio_full = AudioFileClip(audio_path).with_effects(audio_effects)
+        final_video = final_video.with_audio(audio_full)
+
+        if preview:
+            preset, crf, audio_bitrate = "ultrafast", "28", "128k"
+        else:
+            preset, crf, audio_bitrate = config.FINAL_PRESET, config.FINAL_CRF, config.FINAL_AUDIO_BITRATE
+        report(f"Rendering {final_video.duration:.0f}s of video at {video_size[0]}x{video_size[1]}@{fps}fps…")
+        video_logger = _EncodeProgressBridge(on_progress) if on_progress else None
+        final_video.write_videofile(
+            output_path, fps=fps,
+            codec="libx264", audio_codec="aac", audio_bitrate=audio_bitrate,
+            preset=preset, ffmpeg_params=["-crf", crf],
+            threads=4, logger=video_logger,
         )
-        effects = []
-        if i > 0:
-            effects.append(CrossFadeIn(TRANSITION_DUR))
-        if i < len(schedule) - 1:
-            effects.append(CrossFadeOut(TRANSITION_DUR))
-        if effects:
-            clip = clip.with_effects(effects)
-        video_clips.append(clip)
-        report(f"  [{i + 1}/{len(schedule)}] {entry['photo']} ({entry['duration']:.1f}s, {entry.get('effect')})")
+    finally:
+        close_overlay_clips(overlay_clips)
 
-    report("Concatenating clips…")
-    final_video = concatenate_videoclips(video_clips, padding=-TRANSITION_DUR, method="compose")
-
-    video_dur = final_video.duration
-    diff = song_dur - video_dur
-    if diff > 0.5:
-        last_frame = ImageClip(final_video.get_frame(video_dur - 0.1), duration=diff + 0.5).with_fps(fps)
-        final_video = concatenate_videoclips([final_video, last_frame], method="compose")
-    elif diff < -0.5:
-        final_video = final_video.subclipped(0, song_dur)
-
-    report("Attaching audio…")
-    audio_full = AudioFileClip(audio_path).with_effects([AudioFadeOut(2.0)])
-    final_video = final_video.with_audio(audio_full)
-
-    if preview:
-        preset, crf, audio_bitrate = "ultrafast", "28", "128k"
-    else:
-        preset, crf, audio_bitrate = config.FINAL_PRESET, config.FINAL_CRF, config.FINAL_AUDIO_BITRATE
-    report(f"Rendering {final_video.duration:.0f}s of video at {video_size[0]}x{video_size[1]}@{fps}fps…")
-    final_video.write_videofile(
-        output_path, fps=fps,
-        codec="libx264", audio_codec="aac", audio_bitrate=audio_bitrate,
-        preset=preset, ffmpeg_params=["-crf", crf],
-        threads=4, logger=None,
-    )
     report(f"Done -> {output_path}")
     return output_path
