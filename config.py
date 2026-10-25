@@ -27,7 +27,14 @@ FINAL_PRESET = "slow"
 FINAL_AUDIO_BITRATE = "192k"
 
 # ── Effects ───────────────────────────────────────────────────────
-SPARKLE_ENABLED_DEFAULT = True   # glitter/sparkle particles floating over every photo
+# Where the glitter/sparkle particles show up:
+#   "Off"                        - no sparkles
+#   "Everywhere"                 - over every photo
+#   "Sides + opening & closing"  - over the first and last photo, and only over
+#                                  the blurred side areas of portrait photos in
+#                                  between (never over the photo itself)
+SPARKLE_MODES = ["Off", "Everywhere", "Sides + opening & closing"]
+SPARKLE_MODE_DEFAULT = "Everywhere"
 SPARKLE_COUNT = 25               # how many sparkle particles (lower = subtler, higher = busier)
 TRANSITION_DURATION = 1.0        # seconds of cross-dissolve fade between photos
 KEN_BURNS_ENABLED_DEFAULT = True    # slow pan/zoom motion; off = still photos

@@ -207,7 +207,7 @@ def on_generate(photos, audio_path, photo_order, per_photo_dur, title_text,
                 closing_text=closing_text or "",
                 opening_duration=opening_dur,
                 closing_duration=closing_dur,
-                sparkle_enabled=sparkle,
+                sparkle_mode=sparkle,
                 ken_burns_enabled=ken_burns,
                 pastel_grade_enabled=pastel_grade,
                 brightness=brightness,
@@ -326,7 +326,10 @@ with gr.Blocks(
                     minimum=0.5, maximum=15, step=0.5, value=config.DEFAULT_CLOSING_DURATION,
                     label="Closing photo duration (seconds)",
                 )
-                sparkle_in = gr.Checkbox(value=config.SPARKLE_ENABLED_DEFAULT, label="Sparkle overlay")
+                sparkle_in = gr.Radio(
+                    choices=config.SPARKLE_MODES, value=config.SPARKLE_MODE_DEFAULT,
+                    label="Sparkle overlay",
+                )
                 ken_burns_in = gr.Checkbox(value=config.KEN_BURNS_ENABLED_DEFAULT, label="Ken Burns pan/zoom motion")
                 pastel_grade_in = gr.Checkbox(value=config.PASTEL_GRADE_ENABLED_DEFAULT, label="Pastel colour grade")
                 brightness_in = gr.Slider(
