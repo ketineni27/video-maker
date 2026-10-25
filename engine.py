@@ -79,7 +79,7 @@ def fit_portrait(img, size):
     px = (W - new_w) // 2
     py = (H - new_h) // 2
     bg.paste(fg, (px, py))
-    return np.array(bg)
+    return np.array(bg), new_w
 
 
 def load_photo(path, size, auto_color=True):
@@ -94,9 +94,10 @@ def load_photo(path, size, auto_color=True):
         except Exception:
             pass
     if is_portrait(img):
-        return fit_portrait(img, size), True
+        frame, fg_width = fit_portrait(img, size)
+        return frame, True, fg_width
     else:
-        return fit_landscape(img, size), False
+        return fit_landscape(img, size), False, size[0]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -328,13 +329,26 @@ def get_font(size):
 # ═══════════════════════════════════════════════════════════════
 
 def build_photo_clip(photo_path, duration, direction, sparkle_sys, video_size, fps,
-                      lyric="", sparkle_enabled=True, ken_burns_enabled=True,
+                      lyric="", sparkle_mode=config.SPARKLE_MODE_DEFAULT, is_edge=False,
+                      ken_burns_enabled=True,
                       pastel_grade_enabled=True, overlay_clips=None, brightness=1.0,
                       auto_color_enabled=True, ease_motion=True,
                       vignette_strength=0.0, grain_strength=0.0,
                       caption_slide_enabled=True):
-    base_img, portrait = load_photo(photo_path, video_size, auto_color=auto_color_enabled)
+    base_img, portrait, fg_width = load_photo(photo_path, video_size, auto_color=auto_color_enabled)
     W, H = video_size
+
+    sparkle_on = sparkle_mode != "Off"
+    # "Sides" mode: full sparkles on the opening/closing photo (is_edge), and
+    # elsewhere only over the blurred bars beside a portrait photo. The
+    # portrait zoom grows the photo by up to 4%, so the protected zone is
+    # sized for the largest zoom; a landscape photo has no bars, so its
+    # mask is all zeros (no sparkles).
+    sparkle_col_mask = None
+    if sparkle_on and sparkle_mode == "Sides + opening & closing" and not is_edge:
+        half_photo = fg_width * 0.52
+        dist = np.abs(np.arange(W) - W / 2.0)
+        sparkle_col_mask = np.clip((dist - half_photo) / 12.0, 0.0, 1.0).astype(np.float32)
 
     # The caption is built as its own small (text + padding) image rather
     # than a full-frame layer, so it can be pasted at a position that
@@ -370,8 +384,10 @@ def build_photo_clip(photo_path, duration, direction, sparkle_sys, video_size, f
                                  vignette_strength=vignette_strength, grain_strength=grain_strength)
         out = Image.fromarray(frame).convert("RGBA")
 
-        if sparkle_enabled:
+        if sparkle_on:
             sparks = sparkle_sys.render(t)
+            if sparkle_col_mask is not None:
+                sparks[..., 3] = (sparks[..., 3] * sparkle_col_mask[None, :]).astype(np.uint8)
             out = Image.alpha_composite(out, Image.fromarray(sparks))
 
         for clip in (overlay_clips or []):
@@ -516,7 +532,7 @@ def generate_video(
     closing_text=config.DEFAULT_CLOSING_TEXT,
     opening_duration=config.DEFAULT_OPENING_DURATION,
     closing_duration=config.DEFAULT_CLOSING_DURATION,
-    sparkle_enabled=config.SPARKLE_ENABLED_DEFAULT,
+    sparkle_mode=config.SPARKLE_MODE_DEFAULT,
     ken_burns_enabled=config.KEN_BURNS_ENABLED_DEFAULT,
     pastel_grade_enabled=config.PASTEL_GRADE_ENABLED_DEFAULT,
     brightness=config.BRIGHTNESS_DEFAULT,
@@ -543,7 +559,9 @@ def generate_video(
     title_text / closing_text: optional captions on the opening / closing photo
     opening_duration / closing_duration: fixed seconds for the first and last
         photo (only used when there are 3+ photos — see below)
-    sparkle_enabled: overlay the built-in glitter/sparkle particles
+    sparkle_mode: one of config.SPARKLE_MODES — "Off", "Everywhere", or
+        "Sides + opening & closing" (full sparkles on the first/last photo,
+        only over the blurred side bars of portrait photos in between)
     ken_burns_enabled: slow pan/zoom motion; False = still photos
     pastel_grade_enabled: warm pink/lavender colour grade
     brightness: 1.0 = unchanged, >1.0 = brighter, <1.0 = darker
@@ -651,7 +669,8 @@ def generate_video(
         for i, entry in enumerate(schedule):
             clip = build_photo_clip(
                 entry["photo"], entry["duration"], entry.get("effect", "zoom_in"), sparkle,
-                video_size, fps, lyric=entry.get("lyric", ""), sparkle_enabled=sparkle_enabled,
+                video_size, fps, lyric=entry.get("lyric", ""), sparkle_mode=sparkle_mode,
+                is_edge=(i == 0 or i == len(schedule) - 1),
                 ken_burns_enabled=ken_burns_enabled, pastel_grade_enabled=pastel_grade_enabled,
                 overlay_clips=overlay_clips, brightness=brightness,
                 auto_color_enabled=auto_color_enabled, ease_motion=ease_motion,
